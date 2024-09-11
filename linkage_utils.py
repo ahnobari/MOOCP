@@ -23,6 +23,8 @@ from scipy.spatial.distance import pdist,squareform
 import torch
 from scipy.spatial import KDTree, distance
 
+from .LInK.Solver import solve_rev_vectorized_batch
+from .LInK.Optim import preprocess_curves, batch_chamfer_distance, batch_ordered_distance, uniformize, find_transforms, apply_transforms
 def get_oriented(curve):
     """ Orient a curve
     Parameters
@@ -247,26 +249,6 @@ def apply_transformation(tr,curve):
 
     return out
 
-def batch_chamfer_distance(c1,c2):
-    """Chamfer distance between two point clouds
-    Parameters
-    ----------
-    c1: torch tensor [n_points_x, n_dims]
-        first point cloud
-    c2: torch tensor [n_points_y, n_dims]
-        second point cloud
-    Returns
-    -------
-    chamfer_dist: float
-        computed bidirectional Chamfer distance:
-            sum_{x_i \in x}{\min_{y_j \in y}{||x_i-y_j||**2}} + sum_{y_j \in y}{\min_{x_i \in x}{||x_i-y_j||**2}}
-    """
-    d = torch.cdist(c1,c2)
-    d1 = d.min(dim=1)[0].mean(dim=1)
-    d2 = d.min(dim=2)[0].mean(dim=1)
-    chamfer_dist = d1+d2
-    return chamfer_dist
-
 def get_mat(x0, C):
     """Get total link length of mechanism
     Parameters
@@ -341,7 +323,7 @@ def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='
     fixed_nodes: numpy array [n_fixed_nodes]
             A list of the nodes that are grounded/fixed.
     target_pc: numpy array [n_points,2]
-            The target point cloud that the mechanism should match.
+            The target curve that the mechanism should match.
 
     Returns
     -------
@@ -361,7 +343,6 @@ def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='
     """
     # target_pc = target_pc/500
     target_pc = get_oriented(target_pc)
-    scale = target_pc.max()
 
     if idx is None:
         idx = C.shape[0]-1
@@ -380,43 +361,44 @@ def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='
     node_types = np.zeros([1,C.shape[0],1])
     node_types[0,fixed_nodes,:] = 1
     node_types = torch.Tensor(node_types).to(device)
+
+    target_pc = preprocess_curves(torch.Tensor(target_pc).to(device).unsqueeze(0), target_pc.shape[0])[0]
+
     thetas = torch.Tensor(np.linspace(0,np.pi*2,timesteps+1)[0:timesteps]).to(device)
 
-    x_sol,cos = solve_rev_vectorized_batch_wds(A,X,node_types,thetas)
-    best_match = x_sol[0,idx].detach().cpu().numpy()
-    best_tree = KDTree(best_match)
+    x_sol = solve_rev_vectorized_batch(A,X,node_types,thetas)
+    best_matches = x_sol[:,idx]
+    good_idx = ~torch.isnan(best_matches.sum(-1).sum(-1))
 
-    tr = Transformation(best_match)
-    matched_curve = apply_transformation(tr,target_pc/scale)
-    matched_curve_180 = apply_transformation((tr[0]+np.pi,tr[1],tr[2]),target_pc/scale)
+    if good_idx.sum() == 0:
+        return False, None, None, None, None, None
 
-    m_tree = KDTree(matched_curve)
-    m180_tree = KDTree(matched_curve_180)
-
-    multiplier = scale/tr[1]
-
-    cd_tr = np.array([best_tree.query(matched_curve)[0].mean()+m_tree.query(best_match)[0].mean(),best_tree.query(matched_curve_180)[0].mean()+m180_tree.query(best_match)[0].mean()])
-
-    if cd_tr[1]<cd_tr[0]:
-        tr = (tr[0]+np.pi,tr[1],tr[2])
-        matched_curve = matched_curve_180
-
-    target = torch.Tensor(matched_curve.astype(float)).to(device).unsqueeze(0)
+    best_matches[~good_idx] = best_matches[good_idx][0]
+    best_matches = uniformize(best_matches,target_pc.shape[0])
+    
+    
+    tr,sc,an = find_transforms(best_matches,target_pc, batch_ordered_distance)
+    tiled_curves = target_pc.unsqueeze(0).tile([best_matches.shape[0],1,1])
+    tiled_curves = apply_transforms(tiled_curves,tr,sc,-an)
 
     def CD_fn(x0_inp):
-        x0_in = np.reshape(x0_inp,x0.shape)[sorted_order]/multiplier
+        x0_in = np.reshape(x0_inp,x0.shape)[sorted_order]
 
         current_x0 = torch.nn.Parameter(torch.Tensor(np.expand_dims(x0_in,0)),requires_grad = True).to(device)
+
         with torch.no_grad():
+            sol = solve_rev_vectorized_batch(A,current_x0,node_types,thetas)
+            current_sol = sol[:,idx]
+            #find nans at axis 0 level
 
-
-            sol,cos = solve_rev_vectorized_batch_wds(A,current_x0,node_types,thetas)
-
-            ds = torch.square(torch.log(torch.pow(1 - torch.square(cos[0]),0.25))).mean()
-
-            current_sol = sol[0,idx]
-            CD = batch_chamfer_distance(current_sol.unsqueeze(0)/tr[1],target/tr[1])[0]
-
+            good_idx = ~torch.isnan(current_sol.sum(-1).sum(-1))
+            
+            if good_idx.sum() == 0:
+                return 1e6
+            
+            current_sol[good_idx] = uniformize(current_sol[good_idx],current_sol.shape[1])
+            
+            CD = batch_chamfer_distance(current_sol/sc.unsqueeze(-1).unsqueeze(-1),tiled_curves/sc.unsqueeze(-1).unsqueeze(-1))[0]
         # if torch.isnan(current_sol).sum()>0 or CD<=thCD:
         #     break
 
@@ -425,7 +407,7 @@ def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='
         if torch.isnan(CD):
             return 1e6
 
-        return CD.detach().cpu().numpy()*multiplier
+        return CD.detach().cpu().numpy()
 
     def mat_fn(x0_inp):
         x0_in = np.reshape(x0_inp,x0.shape)[sorted_order]
@@ -434,21 +416,28 @@ def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='
         return material.detach().cpu().numpy()
 
     def CD_grad(x0_inp):
-        x0_in = np.reshape(x0_inp,x0.shape)[sorted_order]/multiplier
+        x0_in = np.reshape(x0_inp,x0.shape)[sorted_order]
         current_x0 = torch.nn.Parameter(torch.Tensor(np.expand_dims(x0_in,0)),requires_grad = True).to(device)
 
-        sol,cos = solve_rev_vectorized_batch_wds(A,current_x0,node_types,thetas)
+        sol = solve_rev_vectorized_batch(A,current_x0,node_types,thetas)
+        current_sol = sol[:,idx]
+        #find nans at axis 0 level
 
-        ds = torch.square(torch.log(torch.pow(1 - torch.square(cos[0]),0.25))).mean()
-
-        current_sol = sol[0,idx]
-        CD = batch_chamfer_distance(current_sol.unsqueeze(0)/tr[1],target/tr[1])[0]
+        good_idx = ~torch.isnan(current_sol.sum(-1).sum(-1))
+        
+        if good_idx.sum() == 0:
+            return np.zeros_like(x0_inp)
+        
+        current_sol[good_idx] = uniformize(current_sol[good_idx],current_sol.shape[1])
+        
+        CD = batch_chamfer_distance(current_sol/sc.unsqueeze(-1).unsqueeze(-1),tiled_curves/sc.unsqueeze(-1).unsqueeze(-1))[0]
 
         CD.backward()
 
         if torch.isnan(CD):
             return np.zeros_like(x0_inp)
-        return current_x0.grad.detach().cpu().numpy()[:,inverse_order].reshape(x0_inp.shape)*multiplier
+        
+        return current_x0.grad.detach().cpu().numpy()[0,inverse_order].reshape(x0_inp.shape)
 
     def mat_grad(x0_inp):
         x0_in = np.reshape(x0_inp,x0.shape)[sorted_order]
@@ -460,7 +449,7 @@ def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='
 
         return current_x0.grad.detach().cpu().numpy()[inverse_order].reshape(x0_inp.shape)
 
-    return True, CD_fn, mat_fn, CD_grad, mat_grad, matched_curve*multiplier
+    return True, CD_fn, mat_fn, CD_grad, mat_grad, tiled_curves[0].detach().cpu().numpy()
 
 
 def solve_mechanism(C,x0,fixed_nodes, motor, device='cpu', timesteps=2000):
