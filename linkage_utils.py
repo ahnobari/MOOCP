@@ -249,6 +249,7 @@ def apply_transformation(tr,curve):
 
     return out
 
+@torch.compile
 def get_mat(x0, C):
     """Get total link length of mechanism
     Parameters
@@ -265,7 +266,7 @@ def get_mat(x0, C):
     """
 
     N = C.shape[0]
-    G = torch.zeros_like(C, dtype=float)
+    G = torch.zeros_like(C, dtype=float).to(x0.device)
     for i in range(N):
         for j in range(i):
             if C[i,j]:
@@ -311,8 +312,71 @@ def sort_mech(A, x0, motor,fixed_nodes):
     else:
         return None
 
+def batch_ga_functions(C,x0,fixed_nodes,target_pc, motor, idx=None,device='cpu',timesteps=2000):
+    # target_pc = target_pc/500
+    # target_pc = get_oriented(target_pc)
 
-def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='cpu',timesteps=2000):
+    if idx is None:
+        idx = C.shape[0]-1
+
+    xc = x0.copy()
+    res = sort_mech(C, x0, motor,fixed_nodes)
+    if res: 
+        C, x0, fixed_nodes, sorted_order = res
+        
+        inverse_order = np.argsort(sorted_order)
+    else:
+        return False, None
+    
+    A = torch.Tensor(np.expand_dims(C,0)).to(device)
+    X = torch.Tensor(np.expand_dims(x0,0)).to(device)
+    node_types = np.zeros([1,C.shape[0],1])
+    node_types[0,fixed_nodes,:] = 1
+    node_types = torch.Tensor(node_types).to(device)
+
+    s = torch.sqrt(torch.square(torch.tensor(target_pc).float().to(device).unsqueeze(0)).sum(-1).sum(-1)/target_pc.shape[0]).squeeze()
+    target_pc = preprocess_curves(torch.Tensor(target_pc).to(device).unsqueeze(0), target_pc.shape[0])[0]
+
+    thetas = torch.Tensor(np.linspace(0,np.pi*2,timesteps+1)[0:timesteps]).to(device)
+
+    def evaluate(x0s):
+        N = x0s.shape[0]
+        x0s = torch.Tensor(x0s[:,sorted_order,:]).to(device)
+        As = torch.tile(A,[N,1,1])
+        node_typess = torch.tile(node_types,[N,1,1])
+
+        x_sol = solve_rev_vectorized_batch(As,x0s,node_typess,thetas)
+    
+        best_matches = x_sol[:,idx]
+        good_idx = ~torch.isnan(best_matches.sum(-1).sum(-1))
+
+        if good_idx.sum() == 0:
+            return 1e6, 1e6
+
+        best_matches[~good_idx] = best_matches[good_idx][0]
+        best_matches = uniformize(best_matches,target_pc.shape[0])
+        
+        tr,sc,an = find_transforms(best_matches,target_pc, batch_ordered_distance)
+        tiled_curves = target_pc.unsqueeze(0).tile([best_matches.shape[0],1,1])
+        tiled_curves = apply_transforms(tiled_curves,tr,s*torch.ones_like(sc),-an)
+
+        CD = batch_chamfer_distance(best_matches,tiled_curves)
+
+        CD[torch.isnan(CD)] = 1e6
+
+        mat_use = torch.zeros([N]).to(device)
+        for i in range(N):
+            mat_use[i] = get_mat(x0s[i], As[i])
+        
+        mat_use[torch.isnan(CD)] = 1e6
+
+        return CD.detach().cpu().numpy(), mat_use.detach().cpu().numpy()
+    
+    return True, evaluate
+
+
+
+def optimization_functions(C,x0,fixed_nodes,target_pc, motor, idx=None,device='cpu',timesteps=2000):
     """Simulate, then return functions and gradients for the mechanism
     Parameters
     ----------
@@ -342,7 +406,7 @@ def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='
     
     """
     # target_pc = target_pc/500
-    target_pc = get_oriented(target_pc)
+    # target_pc = get_oriented(target_pc)
 
     if idx is None:
         idx = C.shape[0]-1
@@ -362,6 +426,8 @@ def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='
     node_types[0,fixed_nodes,:] = 1
     node_types = torch.Tensor(node_types).to(device)
 
+    s = torch.sqrt(torch.square(torch.tensor(target_pc).float().to(device).unsqueeze(0)).sum(-1).sum(-1)/target_pc.shape[0]).squeeze()
+
     target_pc = preprocess_curves(torch.Tensor(target_pc).to(device).unsqueeze(0), target_pc.shape[0])[0]
 
     thetas = torch.Tensor(np.linspace(0,np.pi*2,timesteps+1)[0:timesteps]).to(device)
@@ -379,8 +445,9 @@ def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='
     
     tr,sc,an = find_transforms(best_matches,target_pc, batch_ordered_distance)
     tiled_curves = target_pc.unsqueeze(0).tile([best_matches.shape[0],1,1])
-    tiled_curves = apply_transforms(tiled_curves,tr,sc,-an)
+    tiled_curves = apply_transforms(tiled_curves,tr,s*torch.ones_like(sc),-an)
 
+    @torch.compile
     def CD_fn(x0_inp):
         x0_in = np.reshape(x0_inp,x0.shape)[sorted_order]
 
@@ -389,7 +456,6 @@ def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='
         with torch.no_grad():
             sol = solve_rev_vectorized_batch(A,current_x0,node_types,thetas)
             current_sol = sol[:,idx]
-            #find nans at axis 0 level
 
             good_idx = ~torch.isnan(current_sol.sum(-1).sum(-1))
             
@@ -398,27 +464,22 @@ def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='
             
             current_sol[good_idx] = uniformize(current_sol[good_idx],current_sol.shape[1])
             
-            CD = batch_chamfer_distance(current_sol/sc.unsqueeze(-1).unsqueeze(-1),tiled_curves/sc.unsqueeze(-1).unsqueeze(-1))[0]
-        # if torch.isnan(current_sol).sum()>0 or CD<=thCD:
-        #     break
-
-        # final_loss = CD + pen*ds
+            CD = batch_chamfer_distance(current_sol,tiled_curves)[0]
 
         if torch.isnan(CD):
             return 1e6
 
         return CD.detach().cpu().numpy()
 
+    @torch.compile
     def mat_fn(x0_inp):
         x0_in = np.reshape(x0_inp,x0.shape)[sorted_order]
         x0_in = torch.from_numpy(x0_in)
         material = get_mat(x0_in, A[0])
         return material.detach().cpu().numpy()
 
-    def CD_grad(x0_inp):
-        x0_in = np.reshape(x0_inp,x0.shape)[sorted_order]
-        current_x0 = torch.nn.Parameter(torch.Tensor(np.expand_dims(x0_in,0)),requires_grad = True).to(device)
-
+    @torch.compile
+    def forward(current_x0):
         sol = solve_rev_vectorized_batch(A,current_x0,node_types,thetas)
         current_sol = sol[:,idx]
         #find nans at axis 0 level
@@ -426,11 +487,17 @@ def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='
         good_idx = ~torch.isnan(current_sol.sum(-1).sum(-1))
         
         if good_idx.sum() == 0:
-            return np.zeros_like(x0_inp)
+            return batch_chamfer_distance(current_sol,tiled_curves)[0]
         
         current_sol[good_idx] = uniformize(current_sol[good_idx],current_sol.shape[1])
         
-        CD = batch_chamfer_distance(current_sol/sc.unsqueeze(-1).unsqueeze(-1),tiled_curves/sc.unsqueeze(-1).unsqueeze(-1))[0]
+        return batch_chamfer_distance(current_sol,tiled_curves)[0]
+
+    def CD_grad(x0_inp):
+        x0_in = np.reshape(x0_inp,x0.shape)[sorted_order]
+        current_x0 = torch.nn.Parameter(torch.Tensor(np.expand_dims(x0_in,0)),requires_grad = True).to(device)
+
+        CD = forward(current_x0)
 
         CD.backward()
 
@@ -449,7 +516,7 @@ def functions_and_gradients(C,x0,fixed_nodes,target_pc, motor, idx=None,device='
 
         return current_x0.grad.detach().cpu().numpy()[inverse_order].reshape(x0_inp.shape)
 
-    return True, CD_fn, mat_fn, CD_grad, mat_grad, tiled_curves[0].detach().cpu().numpy()
+    return True, CD_fn, CD_grad, mat_fn, mat_grad, tiled_curves[0].detach().cpu().numpy()
 
 
 def solve_mechanism(C,x0,fixed_nodes, motor, device='cpu', timesteps=2000):

@@ -11,7 +11,7 @@ import time
 
 from tqdm.autonotebook import trange, tqdm
 from .Visulization import draw_mechanism
-import gradio as gr
+# import gradio as gr
 
 @torch.compile
 def cosine_search(target_emb, atlas_emb, max_batch_size = 1000000, ids = None):
@@ -237,7 +237,7 @@ def preprocess_curves(curves, n=200):
 def get_scales(curves):
     return jax.numpy.sqrt(jax.numpy.square(curves-curves.mean(1)).sum(-1).sum(-1)/curves.shape[1])
 
-def make_batch_optim_obj(curve,As,x0s,node_types,timesteps=2000, CD_weight=1.0, OD_weight=1.0, start_theta=0.0, end_theta=2*jax.numpy.pi):
+def make_batch_optim_obj(curve,As,x0s,node_types,timesteps=2000, CD_weight=1.0, OD_weight=1.0, start_theta=0.0, end_theta=2*jax.numpy.pi, return_tiled = False):
 
     thetas = jax.numpy.linspace(start_theta,end_theta,timesteps)
     sol = solve_rev_vectorized_batch(As,x0s,node_types,thetas)
@@ -290,6 +290,125 @@ def make_batch_optim_obj(curve,As,x0s,node_types,timesteps=2000, CD_weight=1.0, 
     
     fn = lambda x0s_current: final(x0s_current, As, node_types, curve, thetas, idxs, sc, tiled_curves, CD_weight, OD_weight)
 
+    if return_tiled:
+        return fn, tiled_curves
+    
+    return fn
+
+def make_batch_optim_obj(curve,As,x0s,node_types,timesteps=2000, CD_weight=1.0, OD_weight=1.0, start_theta=0.0, end_theta=2*jax.numpy.pi, return_tiled = False):
+
+    thetas = jax.numpy.linspace(start_theta,end_theta,timesteps)
+    sol = solve_rev_vectorized_batch(As,x0s,node_types,thetas)
+    
+    idxs = (As.sum(-1)>0).sum(-1)-1
+    best_matches = sol[jax.numpy.arange(sol.shape[0]),idxs]
+    good_idx = jax.numpy.logical_not(jax.numpy.isnan(best_matches.sum(-1).sum(-1)))
+    best_matches_masked = best_matches * good_idx[:,None,None]
+    best_matches_r_masked = best_matches[good_idx][0][None].repeat(best_matches.shape[0],0) * ~good_idx[:,None,None]
+    best_matches = best_matches_masked + best_matches_r_masked
+    best_matches = uniformize(best_matches,curve.shape[0])
+    
+    tr,sc,an = find_transforms(best_matches,curve, )
+    tiled_curves = curve[None,:,:].repeat(best_matches.shape[0],0)
+    tiled_curves = apply_transforms(tiled_curves,tr,sc,-an)
+    
+    # def objective(x0s_current):
+    #     current_x0 = x0s_current
+    #     sol = solve_rev_vectorized_batch(As,current_x0,node_types,thetas)
+    #     current_sol = sol[jax.numpy.arange(sol.shape[0]),idxs]
+        
+    #     #find nans at axis 0 level
+    #     good_idx = jax.numpy.logical_not(jax.numpy.isnan(current_sol.sum(-1).sum(-1)))
+
+    #     current_sol_r_masked = current_sol * ~good_idx[:,None,None]
+    #     current_sol = uniformize(current_sol, current_sol.shape[1])
+    #     current_sol = current_sol * good_idx[:,None,None] + current_sol_r_masked
+
+    #     OD = batch_ordered_distance(current_sol[:,jax.numpy.linspace(0,current_sol.shape[1]-1,tiled_curves.shape[1]).astype(int),:]/sc[:,None,None],tiled_curves/sc[:,None,None])
+    #     CD = batch_chamfer_distance(current_sol/sc[:,None,None],tiled_curves/sc[:,None,None])
+    #     objective_function = CD_weight* CD + OD_weight * OD
+
+    #     objective_function = jax.numpy.where(jax.numpy.isnan(objective_function),1e6,objective_function)
+
+    #     return objective_function
+
+    # def get_sum(x0s_current):
+    #     obj = objective(x0s_current)
+    #     return obj.sum(), obj
+        
+    # def final(x0s_current):
+    #     fn = jax.jit(jax.value_and_grad(get_sum,has_aux=True))
+
+    #     val,grad = fn(x0s_current)
+
+    #     val = jax.numpy.nan_to_num(val[1],nan=1e6)
+    #     grad = jax.numpy.nan_to_num(grad,nan=0)
+
+    #     return val,grad
+    
+    fn = lambda x0s_current: final(x0s_current, As, node_types, curve, thetas, idxs, sc, tiled_curves, CD_weight, OD_weight)
+
+    if return_tiled:
+        return fn, tiled_curves
+    
+    return fn
+
+def make_batch_optim_obj_(curve,As,x0s,node_types,timesteps=2000, CD_weight=1.0, OD_weight=1.0, start_theta=0.0, end_theta=2*jax.numpy.pi, return_tiled = False):
+
+    thetas = jax.numpy.linspace(start_theta,end_theta,timesteps)
+    sol = solve_rev_vectorized_batch(As,x0s,node_types,thetas)
+    
+    idxs = (As.sum(-1)>0).sum(-1)-1
+    best_matches = sol[jax.numpy.arange(sol.shape[0]),idxs]
+    good_idx = jax.numpy.logical_not(jax.numpy.isnan(best_matches.sum(-1).sum(-1)))
+    best_matches_masked = best_matches * good_idx[:,None,None]
+    best_matches_r_masked = best_matches[good_idx][0][None].repeat(best_matches.shape[0],0) * ~good_idx[:,None,None]
+    best_matches = best_matches_masked + best_matches_r_masked
+    best_matches = uniformize(best_matches,curve.shape[0])
+    
+    tr,sc,an = find_transforms(best_matches,curve)
+    tiled_curves = curve[None,:,:].repeat(best_matches.shape[0],0)
+    tiled_curves = apply_transforms(tiled_curves,tr,sc,-an)
+    
+    # def objective(x0s_current):
+    #     current_x0 = x0s_current
+    #     sol = solve_rev_vectorized_batch(As,current_x0,node_types,thetas)
+    #     current_sol = sol[jax.numpy.arange(sol.shape[0]),idxs]
+        
+    #     #find nans at axis 0 level
+    #     good_idx = jax.numpy.logical_not(jax.numpy.isnan(current_sol.sum(-1).sum(-1)))
+
+    #     current_sol_r_masked = current_sol * ~good_idx[:,None,None]
+    #     current_sol = uniformize(current_sol, current_sol.shape[1])
+    #     current_sol = current_sol * good_idx[:,None,None] + current_sol_r_masked
+
+    #     OD = batch_ordered_distance(current_sol[:,jax.numpy.linspace(0,current_sol.shape[1]-1,tiled_curves.shape[1]).astype(int),:]/sc[:,None,None],tiled_curves/sc[:,None,None])
+    #     CD = batch_chamfer_distance(current_sol/sc[:,None,None],tiled_curves/sc[:,None,None])
+    #     objective_function = CD_weight* CD + OD_weight * OD
+
+    #     objective_function = jax.numpy.where(jax.numpy.isnan(objective_function),1e6,objective_function)
+
+    #     return objective_function
+
+    # def get_sum(x0s_current):
+    #     obj = objective(x0s_current)
+    #     return obj.sum(), obj
+        
+    # def final(x0s_current):
+    #     fn = jax.jit(jax.value_and_grad(get_sum,has_aux=True))
+
+    #     val,grad = fn(x0s_current)
+
+    #     val = jax.numpy.nan_to_num(val[1],nan=1e6)
+    #     grad = jax.numpy.nan_to_num(grad,nan=0)
+
+    #     return val,grad
+    
+    fn = lambda x0s_current: final_(x0s_current, As, node_types, curve, thetas, idxs, sc, tiled_curves, CD_weight, OD_weight)
+
+    if return_tiled:
+        return fn, tiled_curves
+    
     return fn
 
 def objective(x0s_current, As, node_types, curve, thetas, idxs, sc, tiled_curves, CD_weight, OD_weight):
@@ -316,7 +435,19 @@ def get_sum(x0s_current, As, node_types, curve, thetas, idxs, sc, tiled_curves, 
     obj = objective(x0s_current, As, node_types, curve, thetas, idxs, sc, tiled_curves, CD_weight, OD_weight)
     return obj.sum(), obj
 
+def get_sum_(x0s_current, As, node_types, curve, thetas, idxs, sc, tiled_curves, CD_weight, OD_weight):
+    obj = objective(x0s_current, As, node_types, curve, thetas, idxs, sc, tiled_curves, CD_weight, OD_weight)
+    return obj.sum()
+
+def mat_use(x0s_current, As):
+    jnp = jax.numpy
+    Gs = jnp.square((jnp.expand_dims(x0s_current,1) - jnp.expand_dims(x0s_current,2))).sum(-1)
+    Gs = Gs * As
+    return jnp.sum(Gs)
+
 fn = jax.jit(jax.value_and_grad(get_sum,has_aux=True))
+fn_ = jax.jit(jax.value_and_grad(get_sum_))
+mat_fn = jax.jit(jax.value_and_grad(mat_use))
 
 def final(x0s_current, As, node_types, curve, thetas, idxs, sc, tiled_curves, CD_weight, OD_weight):
     
@@ -326,6 +457,14 @@ def final(x0s_current, As, node_types, curve, thetas, idxs, sc, tiled_curves, CD
     grad = jax.numpy.nan_to_num(grad,nan=0)
 
     return val,grad
+
+def final_(x0s_current, As, node_types, curve, thetas, idxs, sc, tiled_curves, CD_weight, OD_weight):
+        
+    val,grad = fn_(x0s_current, As, node_types, curve, thetas, idxs, sc, tiled_curves, CD_weight, OD_weight)
+
+    val = jax.numpy.nan_to_num(val,nan=1e6)
+
+    return val,grad.reshape(-1)
 
 def smooth_hand_drawn_curves(curves, n=200, n_freq=5):
 
@@ -344,6 +483,143 @@ def smooth_hand_drawn_curves(curves, n=200, n_freq=5):
                                     jax.numpy.real(jax.numpy.fft.ifft(jax.numpy.fft.fft(curves[:,:,1],axis=1)[:,0:n_freq],n=n,axis=1))[:,:,None]],axis=2)
 
     return preprocess_curves(curves,n)
+
+def find_path(A, motor = [0,1], fixed_nodes=[0, 1]):
+    """
+    Deduce node heirarchy of a mechanism
+    Parameters
+    ----------
+    A:          numpy array [N,N]
+                Adjacency/Conncetivity matrix describing the structure of the palanar linkage mechanism.
+    motor:      numpy array [2]
+                Start and end nodes of the driven linkage (Note: this linkage must be connected to ground on one end).
+    fixed_nodes: numpy array [n_fixed_nodes]
+                A list of the nodes that are grounded/fixed.
+    Returns
+    -------
+    path:       numpy array [N,3]   
+                Path of the mechanism
+    valid:      bool
+                If the mechanism is valid
+    """
+
+    path = []
+    
+    A,fixed_nodes,motor = np.array(A),np.array(fixed_nodes),np.array(motor)
+
+    if (A != A.T).any():
+        return [], False
+
+    unknowns = np.array(list(range(A.shape[0])))
+
+    if motor[-1] in fixed_nodes:
+        driven = motor[0]
+        driving = motor[-1]
+    else:
+        driven = motor[-1]
+        driving = motor[0]
+
+    if motor[-1] not in fixed_nodes and motor[0] not in fixed_nodes:
+        return [], False
+
+    for item in fixed_nodes:
+            if item != driving:
+                if A[driven, item]:
+                    return [], False
+
+    knowns = np.concatenate([fixed_nodes,[driven]])
+    
+    unknowns = unknowns[np.logical_not(np.isin(unknowns,knowns))]
+    
+    counter = 0
+    while unknowns.shape[0] != 0:
+        if counter == unknowns.shape[0]:
+            # Non dyadic or DOF larger than 1
+            return [], False
+        n = unknowns[counter]
+        ne = np.where(A[n])[0]
+        
+        kne = knowns[np.isin(knowns,ne)]
+#         print(kne.shape[0])
+        
+        if kne.shape[0] == 2:
+            
+            path.append([n,kne[0],kne[1]])
+            counter = 0
+            knowns = np.concatenate([knowns,[n]])
+            unknowns = unknowns[unknowns!=n]
+        elif kne.shape[0] > 2:
+            #redundant or overconstraint
+            return [], False
+        else:
+            counter += 1
+    return np.array(path), True
+
+def sort_mech(A, x0, motor,fixed_nodes):
+    if motor[1] in fixed_nodes:
+        return None
+    nt = np.zeros([A.shape[0],1])
+    nt[fixed_nodes] = 1 
+
+
+    if motor[-1] in fixed_nodes:
+        t = motor[0]
+        motor[0] = motor[1]
+        motor[1] = t
+
+    motor_first_order = np.arange(A.shape[0])
+    motor_first_order = motor_first_order[motor_first_order!=motor[0]]
+    motor_first_order = motor_first_order[motor_first_order!=motor[1]]
+    motor_first_order = np.concatenate([motor,motor_first_order])
+
+ 
+    
+    A = A[motor_first_order,:][:,motor_first_order]
+    x0 = x0[motor_first_order]
+    nt = nt[motor_first_order]
+    p,check = find_path(A,[0,1],np.where(nt)[0])
+
+ 
+
+    if check and len(p.shape)>1:
+        fixed_nodes = np.where(nt[1:])[0]+1
+        sorted_order = np.concatenate([[0,1],fixed_nodes,p[:,0]])
+        A = A[sorted_order,:][:,sorted_order]
+        x0 = x0[sorted_order]
+        nt = nt[sorted_order]
+        return A,x0,np.where(nt)[0], motor_first_order[sorted_order]
+    else:
+        return None
+
+def optimization_functions(C,x0,fixed_nodes,target_curve, motor, timesteps=2000):
+    res = sort_mech(C, x0, motor,fixed_nodes)
+    if res: 
+        C, x0, fixed_nodes, sorted_order = res
+        
+        inverse_order = np.argsort(sorted_order)
+    else:
+        return False, None, None, None
+
+    # A = torch.Tensor(np.expand_dims(C,0)).to(device)
+    # X = torch.Tensor(np.expand_dims(x0,0)).to(device)
+    # node_types = np.zeros([1,C.shape[0],1])
+    # node_types[0,fixed_nodes,:] = 1
+    # node_types = torch.Tensor(node_types).to(device)
+    
+    As = jax.numpy.array(np.expand_dims(C,0))
+    x0s = jax.numpy.array(np.expand_dims(x0,0))
+    node_types = np.zeros([1,C.shape[0],1])
+    node_types[0,fixed_nodes,:] = 1
+    node_types = jax.numpy.array(node_types)
+
+    obj_fn_, t_c = make_batch_optim_obj_(target_curve,As,x0s,node_types,timesteps=timesteps, CD_weight=1.0, OD_weight=0.25, return_tiled=True)
+    obj_fn = lambda x: obj_fn_(x.reshape(x0.shape)[sorted_order].reshape(x0s.shape))
+
+    mat_f = lambda x: mat_fn(x.reshape(x0.shape)[sorted_order].reshape(x0s.shape),As)
+
+    return True, obj_fn, mat_f, np.array(t_c[0])
+
+
 
 def progerss_uppdater(x, prog=None):
     if prog is not None:
