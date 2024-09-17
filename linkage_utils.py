@@ -249,7 +249,7 @@ def apply_transformation(tr,curve):
 
     return out
 
-@torch.compile
+# @torch.compile
 def get_mat(x0, C):
     """Get total link length of mechanism
     Parameters
@@ -447,7 +447,7 @@ def optimization_functions(C,x0,fixed_nodes,target_pc, motor, idx=None,device='c
     tiled_curves = target_pc.unsqueeze(0).tile([best_matches.shape[0],1,1])
     tiled_curves = apply_transforms(tiled_curves,tr,s*torch.ones_like(sc),-an)
 
-    @torch.compile
+    # @torch.compile
     def CD_fn(x0_inp):
         x0_in = np.reshape(x0_inp,x0.shape)[sorted_order]
 
@@ -471,14 +471,14 @@ def optimization_functions(C,x0,fixed_nodes,target_pc, motor, idx=None,device='c
 
         return CD.detach().cpu().numpy()
 
-    @torch.compile
+    # @torch.compile
     def mat_fn(x0_inp):
         x0_in = np.reshape(x0_inp,x0.shape)[sorted_order]
         x0_in = torch.from_numpy(x0_in)
         material = get_mat(x0_in, A[0])
         return material.detach().cpu().numpy()
 
-    @torch.compile
+    # @torch.compile
     def forward(current_x0):
         sol = solve_rev_vectorized_batch(A,current_x0,node_types,thetas)
         current_sol = sol[:,idx]
